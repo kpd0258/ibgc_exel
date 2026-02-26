@@ -1,269 +1,299 @@
 import os
 import re
 import uuid
-import threading
 import time
-from copy import copy
-from typing import Dict, Any, List
+import threading
+from datetime import datetime
+from typing import Dict, Any, List, Optional
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, abort
+from flask_cors import CORS
 from openpyxl import load_workbook
 
-app = Flask(__name__)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_PATH = os.path.join(APP_ROOT, "IBGC_Application_Template.xlsx")
 
-# 템플릿 파일명 (repo에 있는 파일명과 동일해야 함)
-TEMPLATE_FILENAME = "IBGC_Application_Template.xlsx"
-TEMPLATE_PATH = os.path.join(BASE_DIR, TEMPLATE_FILENAME)
+GENERATED_DIR = os.path.join(APP_ROOT, "generated")
+os.makedirs(GENERATED_DIR, exist_ok=True)
 
-# Render free 환경: 쓰기 가능한 위치는 /tmp
-OUT_DIR = "/tmp/generated"
-os.makedirs(OUT_DIR, exist_ok=True)
-
-# ----------------------------
-# Job Store (in-memory)
-# Render free는 재시작/슬립 시 메모리 초기화 가능
-# -> "정확한 진행률"은 실행 중에만 보장됨
-# ----------------------------
+# 간단 job store (Render 단일 인스턴스 기준)
+# (추후 대량처리/다중인스턴스면 Redis/DB로 바꾸는 게 정석)
 JOBS: Dict[str, Dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 
+app = Flask(__name__)
+CORS(app)
 
-@app.get("/health")
-def health():
-    return "ok", 200
+
+# -------------------------
+# Utilities
+# -------------------------
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
 
 
 def safe_filename(name: str) -> str:
-    name = re.sub(r'[\\/*?:"<>|]', "", name or "")
-    return name.strip()
-
-
-def _remove_external_links_if_possible(wb):
     """
-    템플릿에 externalLinks가 있으면 Excel이 '복구' 메시지를 띄울 수 있음.
-    완전 해결은 템플릿에서 '링크 끊기'가 정답이지만,
-    서버에서도 가능한 범위에서 제거 시도(경고 감소용)
+    파일명 안전화:
+    - 한글/영문/숫자/공백/._- 허용
+    - 나머지는 _
+    - 공백은 _로
+    - 끝에 .xlsx 없으면 붙임
     """
-    try:
-        if hasattr(wb, "_external_links"):
-            wb._external_links = []
-    except Exception:
-        pass
-
-    try:
-        if hasattr(wb, "_rels") and wb._rels:
-            to_remove = []
-            for r in wb._rels:
-                rtype = getattr(r, "type", "") or ""
-                if "externalLink" in rtype:
-                    to_remove.append(r)
-            for r in to_remove:
-                try:
-                    wb._rels.remove(r)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    name = (name or "").strip()
+    if not name:
+        name = "export"
+    name = name.replace(" ", "_")
+    name = re.sub(r"[^0-9A-Za-z가-힣._-]+", "_", name)
+    if not name.lower().endswith(".xlsx"):
+        name += ".xlsx"
+    return name
 
 
-def _sanitize_cell_value(v: str) -> str:
+def parse_rows_text(rows_text: Optional[str]) -> List[List[str]]:
     """
-    구분자(|) / 줄바꿈이 데이터 안에 있으면 컬럼/행 깨짐
-    방어적으로 제거
+    rows_text:
+    - 각 줄 = 한 행
+    - 열 구분 = |
     """
-    if v is None:
-        return ""
-    s = str(v)
-    s = s.replace("|", " ")
-    s = s.replace("\r\n", " ")
-    s = s.replace("\n", " ")
-    s = s.replace("\r", " ")
-    return s
-
-
-def _count_rows_from_rows_text(rows_text: str) -> int:
-    rows_text = (rows_text or "").strip()
     if not rows_text:
-        return 0
-    return len([line for line in rows_text.split("\n") if line.strip() != ""])
+        return []
+    lines = [ln for ln in rows_text.splitlines() if ln.strip() != ""]
+    rows = []
+    for ln in lines:
+        rows.append([cell.strip() for cell in ln.split("|")])
+    return rows
 
 
-def _write_one_row(ws, excel_row: int, row_text: str, clear_strike_and_underline: bool = True):
-    cols = row_text.split("|")
-    for j, value in enumerate(cols):
-        c = ws.cell(row=excel_row, column=j + 1)
-        c.value = _sanitize_cell_value(value)
-
-        # 템플릿의 취소선/밑줄이 값에 따라오는 문제 방지
-        if clear_strike_and_underline:
-            try:
-                f = copy(c.font)
-                c.font = f.copy(strike=False, underline=None)
-            except Exception:
-                pass
-
-
-def _job_update(job_id: str, **kwargs):
+def set_job(job_id: str, patch: Dict[str, Any]) -> None:
     with JOBS_LOCK:
-        if job_id in JOBS:
-            JOBS[job_id].update(kwargs)
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job.update(patch)
 
 
-def _job_get(job_id: str) -> Dict[str, Any]:
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     with JOBS_LOCK:
-        return dict(JOBS.get(job_id, {}))
+        job = JOBS.get(job_id)
+        return dict(job) if job else None
 
 
-def _build_excel_background(job_id: str, payload: Dict[str, Any]):
+def init_job(job_id: str, filename: str) -> None:
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",          # queued | running | done | failed
+            "progress_percent": 0,
+            "error": "",
+            "file_path": "",
+            "file_url": "",
+            "filename": filename,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+
+
+# -------------------------
+# Excel generation worker
+# -------------------------
+def generate_excel_worker(job_id: str, payload: Dict[str, Any], base_url: str) -> None:
     """
-    백그라운드에서 엑셀 생성하면서 progress를 업데이트
+    정확한 진행률을 위해:
+    - 전체 "행" 단위 작업량(total_rows)을 계산
+    - 각 행을 쓰면 done_rows 증가
     """
     try:
         if not os.path.exists(TEMPLATE_PATH):
-            _job_update(job_id, status="failed", error=f"Template not found: {TEMPLATE_FILENAME}")
-            return
+            raise FileNotFoundError(f"Template not found: {TEMPLATE_PATH}")
 
-        wb = load_workbook(TEMPLATE_PATH)
-        _remove_external_links_if_possible(wb)
+        set_job(job_id, {"status": "running", "progress_percent": 1, "updated_at": now_iso()})
 
-        # 파일명 결정
-        custom_filename = payload.get("filename")
-        if custom_filename:
-            custom_filename = safe_filename(custom_filename)
-            if not custom_filename.lower().endswith(".xlsx"):
-                custom_filename += ".xlsx"
-            filename = custom_filename
-        else:
-            filename = f"{uuid.uuid4()}.xlsx"
-
-        sheets: List[Dict[str, Any]] = payload.get("sheets") or []
+        sheets = payload.get("sheets") or []
         if not isinstance(sheets, list) or len(sheets) == 0:
-            _job_update(job_id, status="failed", error="No sheets provided")
-            return
+            raise ValueError("payload.sheets must be a non-empty list")
 
-        # 총 작업량(정확 진행률) = 모든 시트의 총 행 수 합
+        # 사전 파싱 (total 계산)
+        parsed: List[Dict[str, Any]] = []
         total_rows = 0
-        per_sheet_counts = []
-        for s in sheets:
-            rows_text = s.get("rows_text", "")
-            c = _count_rows_from_rows_text(rows_text)
-            per_sheet_counts.append(c)
-            total_rows += c
+        for sh in sheets:
+            name = sh.get("name")
+            start_row = int(sh.get("start_row", 1))
+            start_col = int(sh.get("start_col", 1))
+            rows_text = sh.get("rows_text", "")
+            rows = parse_rows_text(rows_text)
+            total_rows += len(rows)
+            parsed.append({
+                "name": name,
+                "start_row": start_row,
+                "start_col": start_col,
+                "rows": rows
+            })
 
+        # total_rows가 0이면 진행률을 "즉시 done"으로 만들기보단 실패로 처리(원하면 정책 변경 가능)
         if total_rows == 0:
-            _job_update(job_id, status="failed", error="No rows to write (rows_text all empty)")
-            return
+            raise ValueError("No rows to write (all rows_text are empty).")
 
-        _job_update(job_id, status="running", total_rows=total_rows, processed_rows=0, progress_percent=0)
+        # 템플릿 로딩 (여기서도 진행률 조금 올림)
+        wb = load_workbook(TEMPLATE_PATH)
+        set_job(job_id, {"progress_percent": 3, "updated_at": now_iso()})
 
-        processed = 0
+        done_rows = 0
 
-        # 시트별로 작성
-        for si, s in enumerate(sheets):
-            name = (s.get("name") or "").strip()
-            start_row = int(s.get("start_row", 9))
-            rows_text = (s.get("rows_text") or "").strip()
+        # 시트별 기록
+        for sh in parsed:
+            sheet_name = sh["name"]
+            if sheet_name not in wb.sheetnames:
+                raise ValueError(f"Sheet not found in template: {sheet_name}")
 
-            if not name:
-                continue
-            if name not in wb.sheetnames:
-                # 시트명 불일치면 실패 처리(진짜 진행률이 필요하므로 조용히 스킵하지 않음)
-                _job_update(job_id, status="failed", error=f"Sheet not found: {name}")
-                return
+            ws = wb[sheet_name]
+            r0 = sh["start_row"]
+            c0 = sh["start_col"]
+            rows = sh["rows"]
 
-            ws = wb[name]
+            for i, row_vals in enumerate(rows):
+                r = r0 + i
+                for j, val in enumerate(row_vals):
+                    c = c0 + j
+                    ws.cell(row=r, column=c, value=val)
 
-            if not rows_text:
-                continue
+                done_rows += 1
+                # 정확한 %: 3%~98% 사이로 매핑 (마지막 저장/정리 구간 남겨둠)
+                pct = 3 + int((done_rows / total_rows) * 95)
+                if pct > 98:
+                    pct = 98
+                set_job(job_id, {"progress_percent": pct, "updated_at": now_iso()})
 
-            lines = [line for line in rows_text.split("\n") if line.strip() != ""]
-            for i, line in enumerate(lines):
-                excel_row = start_row + i
-                _write_one_row(ws, excel_row, line, clear_strike_and_underline=True)
+                # 너무 잦은 업데이트가 부담되면 (예: 1000행 이상) 아래처럼 간격을 둘 수도 있음
+                # if done_rows % 10 == 0: set_job(...)
 
-                processed += 1
-                percent = int((processed / total_rows) * 100)
-                if percent > 100:
-                    percent = 100
+        # 저장 (여기서 99→100)
+        filename = safe_filename(payload.get("filename", "export"))
+        job_dir = os.path.join(GENERATED_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        out_path = os.path.join(job_dir, filename)
 
-                _job_update(
-                    job_id,
-                    processed_rows=processed,
-                    progress_percent=percent,
-                    current_sheet=name,
-                    current_sheet_index=si + 1,
-                    current_sheet_total=len(sheets),
-                )
+        set_job(job_id, {"progress_percent": 99, "updated_at": now_iso()})
+        wb.save(out_path)
 
-                # 너무 빠르면 UI가 못 따라가서, 아주 약간의 여유(원하면 제거 가능)
-                # time.sleep(0.001)
+        file_url = f"{base_url}/generated/{job_id}/{filename}"
 
-        output_path = os.path.join(OUT_DIR, filename)
-        wb.save(output_path)
-
-        file_url = f"{payload.get('_host_url', '').rstrip('/')}/generated/{filename}"
-        _job_update(job_id, status="done", progress_percent=100, file_url=file_url, filename=filename)
+        set_job(job_id, {
+            "status": "done",
+            "progress_percent": 100,
+            "file_path": out_path,
+            "file_url": file_url,
+            "updated_at": now_iso()
+        })
 
     except Exception as e:
-        _job_update(job_id, status="failed", error=str(e))
+        set_job(job_id, {
+            "status": "failed",
+            "error": str(e),
+            "updated_at": now_iso()
+        })
+
+
+# -------------------------
+# Routes
+# -------------------------
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
 
 
 @app.post("/excel/start")
 def excel_start():
-    payload = request.get_json(force=True) or {}
+    """
+    Request JSON:
+    {
+      "filename": "IBGC_Application_2026-02-27",
+      "sheets": [
+        {"name":"1. 인증신청서 관리","start_row":8,"start_col":1,"rows_text":"..."},
+        ...
+      ]
+    }
 
-    # host_url은 백그라운드에서 file_url 생성용
-    payload["_host_url"] = request.host_url.rstrip("/")
+    Response:
+    { "job_id": "...", "status_url": "...", "status": "queued" }
+    """
+    payload = request.get_json(force=True, silent=False)
+    filename = safe_filename((payload or {}).get("filename", "export"))
 
-    job_id = str(uuid.uuid4())
-    with JOBS_LOCK:
-        JOBS[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "progress_percent": 0,
-            "processed_rows": 0,
-            "total_rows": 0,
-            "file_url": None,
-            "error": None,
-            "filename": None,
-            "created_at": int(time.time()),
-        }
+    job_id = uuid.uuid4().hex
+    init_job(job_id, filename)
 
-    t = threading.Thread(target=_build_excel_background, args=(job_id, payload), daemon=True)
-    t.start()
+    # Render 환경에서 base_url 만들기
+    base_url = request.host_url.rstrip("/")
 
-    return jsonify({"job_id": job_id})
+    th = threading.Thread(
+        target=generate_excel_worker,
+        args=(job_id, payload, base_url),
+        daemon=True
+    )
+    th.start()
+
+    status_url = f"{base_url}/excel/status/{job_id}"
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": status_url
+    })
 
 
 @app.get("/excel/status/<job_id>")
 def excel_status(job_id: str):
-    job = _job_get(job_id)
+    """
+    Response:
+    {
+      "job_id": "...",
+      "status": "running|done|failed",
+      "progress_percent": 0-100,
+      "file_url": "...(done일 때)",
+      "error": "...(failed일 때)"
+    }
+    """
+    job = get_job(job_id)
     if not job:
-        return jsonify({"error": "job not found"}), 404
+        return jsonify({
+            "job_id": job_id,
+            "status": "failed",
+            "progress_percent": 0,
+            "file_url": "",
+            "error": "job not found"
+        }), 404
 
-    # 필요한 필드만 깔끔하게 반환
     return jsonify({
-        "job_id": job.get("job_id"),
-        "status": job.get("status"),
-        "progress_percent": job.get("progress_percent", 0),
-        "processed_rows": job.get("processed_rows", 0),
-        "total_rows": job.get("total_rows", 0),
-        "current_sheet": job.get("current_sheet"),
-        "current_sheet_index": job.get("current_sheet_index"),
-        "current_sheet_total": job.get("current_sheet_total"),
-        "file_url": job.get("file_url"),
-        "filename": job.get("filename"),
-        "error": job.get("error"),
+        "job_id": job_id,
+        "status": job.get("status", "failed"),
+        "progress_percent": int(job.get("progress_percent", 0)),
+        "file_url": job.get("file_url", ""),
+        "error": job.get("error", "")
     })
 
 
-@app.get("/generated/<path:filename>")
-def download_file(filename):
+@app.get("/generated/<job_id>/<path:filename>")
+def download_generated(job_id: str, filename: str):
+    """
+    실제 다운로드 엔드포인트.
+    filename을 URL에 포함시켜서 "저장되는 파일명"이 난수가 아니라 지정된 이름으로 떨어지게 함.
+    """
+    job_dir = os.path.join(GENERATED_DIR, job_id)
+    file_path = os.path.join(job_dir, filename)
+
+    if not os.path.exists(file_path):
+        abort(404)
+
+    # as_attachment=True 로 다운로드 강제 + download_name으로 파일명 고정(Flask 2+)
     return send_from_directory(
-        OUT_DIR,
-        filename,
+        directory=job_dir,
+        path=filename,
         as_attachment=True,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        download_name=filename
     )
+
+
+if __name__ == "__main__":
+    # 로컬 테스트
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
