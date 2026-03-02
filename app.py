@@ -11,6 +11,7 @@ CORS(app)
 # =========================
 # ENV VARIABLES
 # =========================
+
 EXCEL_API_KEY = os.environ.get("EXCEL_API_KEY", "")
 
 BUBBLE_BASE_URL = os.environ.get("BUBBLE_BASE_URL", "").rstrip("/")
@@ -23,10 +24,14 @@ BUBBLE_DATA_API_BASE = f"{BUBBLE_BASE_URL}/api/1.1/obj"
 
 KST = timezone(timedelta(hours=9))
 
+GENERATED_DIR = "generated"
+os.makedirs(GENERATED_DIR, exist_ok=True)
+
 
 # =========================
 # UTIL
 # =========================
+
 def require_api_key(req):
     if not EXCEL_API_KEY:
         return True
@@ -41,9 +46,23 @@ def today_label():
     return now_kst().strftime("IBGC_Application_%Y%m%d.xlsx")
 
 
+def parse_bubble_dt(value):
+    """
+    Bubble date format can vary. We'll attempt ISO parse; if fails, return None.
+    """
+    if not value:
+        return None
+    try:
+        # common: "2026-03-02T14:56:00.000Z" or similar
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
 # =========================
 # BUBBLE DATA API HELPERS
 # =========================
+
 def bubble_headers():
     return {
         "Authorization": f"Bearer {BUBBLE_DATA_API_TOKEN}",
@@ -51,49 +70,84 @@ def bubble_headers():
     }
 
 
-def _ensure_success(res, context: str):
-    # Bubble Data API: create는 201, read는 200이 흔함
-    if res.status_code not in (200, 201):
-        raise Exception(f"{context}: {res.status_code} {res.text}")
+def bubble_get(url):
+    res = requests.get(url, headers=bubble_headers(), timeout=60)
+    return res
+
+
+def bubble_post(url, payload):
+    res = requests.post(url, headers=bubble_headers(), json=payload, timeout=60)
+    return res
 
 
 def get_all_applications():
     url = f"{BUBBLE_DATA_API_BASE}/{BUBBLE_APP_TYPE}"
-    res = requests.get(url, headers=bubble_headers())
-    _ensure_success(res, "Bubble fetch error")
+    res = bubble_get(url)
+    if res.status_code != 200:
+        raise Exception(f"Bubble fetch error: {res.status_code} {res.text}")
+
     return res.json().get("response", {}).get("results", [])
 
 
-def create_daily_excel_record(file_url, label, source_count):
-    # DailyExcel 타입에 저장
+def create_daily_excel_record(file_url, label, source_count, status="ready"):
+    """
+    DailyExcel fields (as per your Bubble screenshot):
+    - file (file)          -> we won't set via URL string
+    - file_url (text)      -> set this
+    - label (text)
+    - source_count (number)
+    - status (text)
+    """
     url = f"{BUBBLE_DATA_API_BASE}/DailyExcel"
 
-    # ⚠️ dev/live 스키마 불일치 이슈가 있어서 status는 일단 빼고 안정화
     payload = {
-        "file": file_url,       # Bubble file 필드(Url string 저장 가능)
-        "file_url": file_url,   # text 필드
-        "label": label,         # text
-        "source_count": source_count,  # number
+        "file_url": file_url,
+        "label": label,
+        "source_count": source_count,
+        "status": status,
     }
 
-    res = requests.post(url, headers=bubble_headers(), json=payload)
-    _ensure_success(res, "Bubble create error")
+    res = bubble_post(url, payload)
 
-    return res.json()
+    # Bubble can return 200 or 201 on create
+    if res.status_code not in (200, 201):
+        raise Exception(f"Bubble create error: {res.status_code} {res.text}")
+
+    # Some Bubble responses are simple {"status":"success","id":"..."}
+    try:
+        return res.json()
+    except Exception:
+        return {"raw": res.text}
 
 
 def get_latest_daily_excel():
-    # Bubble Data API의 정렬 키는 보통 created_date / modified_date 를 사용
-    url = f"{BUBBLE_DATA_API_BASE}/DailyExcel?sort_field=Created%20Date&descending=true&limit=1"
-    res = requests.get(url, headers=bubble_headers())
-    _ensure_success(res, "Bubble latest error")
+    """
+    Avoid relying on Bubble 'sort_field' (can break with Created Date naming).
+    We'll fetch a chunk and pick latest on server side.
+    """
+    url = f"{BUBBLE_DATA_API_BASE}/DailyExcel?limit=100"
+    res = bubble_get(url)
+    if res.status_code != 200:
+        raise Exception(f"Bubble latest error: {res.status_code} {res.text}")
+
     results = res.json().get("response", {}).get("results", [])
-    return results[0] if results else None
+    if not results:
+        return None
+
+    def get_created_dt(item):
+        # Bubble sometimes returns "Created Date" or "created_date"
+        v = item.get("Created Date") or item.get("created_date") or item.get("created_at")
+        dt = parse_bubble_dt(v)
+        return dt or datetime.min.replace(tzinfo=timezone.utc)
+
+    results.sort(key=get_created_dt, reverse=True)
+    return results[0]
 
 
 # =========================
 # EXCEL GENERATION
 # =========================
+
 def generate_excel_file():
     applications = get_all_applications()
 
@@ -103,22 +157,21 @@ def generate_excel_file():
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb.active
 
+    # example: write from row 9
     start_row = 9
     row = start_row
 
     for idx, app_data in enumerate(applications, start=1):
-        ws[f"A{row}"] = idx  # No
+        ws[f"A{row}"] = idx
         ws[f"B{row}"] = app_data.get("company", "")
         ws[f"C{row}"] = app_data.get("iso", "")
         row += 1
 
     filename = today_label()
-    generated_dir = "generated"
-    os.makedirs(generated_dir, exist_ok=True)
-
-    file_path = os.path.join(generated_dir, filename)
+    file_path = os.path.join(GENERATED_DIR, filename)
     wb.save(file_path)
 
+    # Public download URL from this service
     public_url = f"{request.host_url.rstrip('/')}/download/{filename}"
     return public_url, filename, len(applications)
 
@@ -126,6 +179,7 @@ def generate_excel_file():
 # =========================
 # ROUTES
 # =========================
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
@@ -138,23 +192,32 @@ def excel_generate_daily():
 
     try:
         file_url, label, source_count = generate_excel_file()
-        bubble_result = create_daily_excel_record(file_url, label, source_count)
+
+        # status까지 확실히 저장
+        bubble_res = create_daily_excel_record(
+            file_url=file_url,
+            label=label,
+            source_count=source_count,
+            status="ready",
+        )
 
         return jsonify({
             "ok": True,
             "file_url": file_url,
             "label": label,
             "source_count": source_count,
-            "bubble": bubble_result,  # Bubble이 준 id 등을 같이 반환
+            "bubble_status": bubble_res.get("status", "success"),
+            "bubble_id": bubble_res.get("id"),
         })
 
     except Exception as e:
+        # 실패 케이스도 status 기록하고 싶으면 여기서 Bubble에 error 레코드 남기게 확장 가능
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/excel/refresh_now", methods=["POST"])
 def excel_refresh_now():
-    # 같은 로직 재사용
+    # same behavior
     return excel_generate_daily()
 
 
@@ -170,8 +233,9 @@ def excel_latest():
 
         return jsonify({
             "ok": True,
-            "file_url": latest.get("file") or latest.get("file_url"),
+            "file_url": latest.get("file_url") or latest.get("file"),
             "label": latest.get("label"),
+            "status": latest.get("status"),
             "source_count": latest.get("source_count"),
             "created_at": latest.get("Created Date") or latest.get("created_date"),
         })
@@ -182,12 +246,13 @@ def excel_latest():
 
 @app.route("/download/<filename>", methods=["GET"])
 def download_file(filename):
-    generated_dir = os.path.join(os.getcwd(), "generated")
-    return send_from_directory(generated_dir, filename, as_attachment=True)
+    # Serve from generated folder
+    return send_from_directory(GENERATED_DIR, filename, as_attachment=True)
 
 
 # =========================
 # MAIN
 # =========================
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
