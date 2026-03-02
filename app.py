@@ -84,7 +84,7 @@ def create_daily_excel_record(file_url, label, source_count):
 
 def get_latest_daily_excel():
     # Bubble Data API의 정렬 키는 보통 created_date / modified_date 를 사용
-    url = f"{BUBBLE_DATA_API_BASE}/DailyExcel?sort_field=created_date&descending=true&limit=1"
+    url = f"{BUBBLE_DATA_API_BASE}/DailyExcel?sort_field=Created%20Date&descending=true&limit=1"
     res = requests.get(url, headers=bubble_headers())
     _ensure_success(res, "Bubble latest error")
     results = res.json().get("response", {}).get("results", [])
