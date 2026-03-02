@@ -1,0 +1,18 @@
+name: Daily Excel Generator
+
+on:
+  schedule:
+    # 한국시간 00:00 = UTC 15:00
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+jobs:
+  trigger-render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call Render generate_daily endpoint
+        run: |
+          curl -X POST "https://ibgc-excel.onrender.com/excel/generate_daily" \
+          -H "X-API-Key: ${{ secrets.EXCEL_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -d "{}"
