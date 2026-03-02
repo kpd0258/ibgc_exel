@@ -1,12 +1,7 @@
 import os
-import uuid
-import json
-import threading
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple, Optional
-
 import requests
-from flask import Flask, jsonify, request, send_from_directory, abort
+from datetime import datetime, timezone, timedelta
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from openpyxl import load_workbook
 
@@ -14,304 +9,174 @@ app = Flask(__name__)
 CORS(app)
 
 # =========================
-# ENV
+# ENV VARIABLES
 # =========================
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")  # e.g. https://ibgc-exel.onrender.com
-EXCEL_API_KEY = os.getenv("EXCEL_API_KEY", "")  # simple shared secret for Bubble -> Render
 
-BUBBLE_BASE_URL = os.getenv("BUBBLE_BASE_URL", "").rstrip("/")  # e.g. https://ibgc.co.kr/version-test
-BUBBLE_API_TOKEN = os.getenv("BUBBLE_API_TOKEN", "")  # Bubble Admin API Token
+EXCEL_API_KEY = os.environ.get("EXCEL_API_KEY", "")
+BUBBLE_BASE_URL = os.environ.get("BUBBLE_BASE_URL", "").rstrip("/")
+BUBBLE_DATA_API_TOKEN = os.environ.get("BUBBLE_DATA_API_TOKEN", "")
+BUBBLE_APP_TYPE = os.environ.get("BUBBLE_APP_TYPE", "00. Application")
+TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "IBGC_Application_Template.xlsx")
 
-# Bubble Data API endpoint base:
-# Bubble typically: {base}/api/1.1/obj/{Thing}
 BUBBLE_DATA_API_BASE = f"{BUBBLE_BASE_URL}/api/1.1/obj"
 
-# Template & output
-TEMPLATE_PATH = os.getenv("TEMPLATE_PATH", "template.xlsx")
-GENERATED_DIR = os.getenv("GENERATED_DIR", "generated")
-os.makedirs(GENERATED_DIR, exist_ok=True)
+KST = timezone(timedelta(hours=9))
+
 
 # =========================
-# In-memory job store
+# UTIL
 # =========================
-_jobs_lock = threading.Lock()
-_jobs: Dict[str, Dict[str, Any]] = {}
-_latest: Dict[str, Any] = {
-    "status": "none",
-    "file_url": "",
-    "filename": "",
-    "created_at": "",
-    "row_count": 0,
-}
 
-def _auth_ok(req) -> bool:
+def require_api_key(req):
     if not EXCEL_API_KEY:
-        return True  # if you didn't set it, allow
-    return req.headers.get("X-API-Key", "") == EXCEL_API_KEY
+        return True
+    return req.headers.get("X-API-Key") == EXCEL_API_KEY
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
-def _public_file_url(filename: str) -> str:
-    # MUST be absolute and valid
-    if PUBLIC_BASE_URL:
-        return f"{PUBLIC_BASE_URL}/generated/{filename}"
-    # fallback to request host if PUBLIC_BASE_URL not set
-    base = request.host_url.rstrip("/")
-    return f"{base}/generated/{filename}"
+def now_kst():
+    return datetime.now(KST)
+
+
+def today_label():
+    return now_kst().strftime("IBGC_Application_%Y%m%d.xlsx")
+
 
 # =========================
-# Bubble Data API fetch
+# BUBBLE DATA API HELPERS
 # =========================
-def _bubble_headers() -> Dict[str, str]:
-    # Bubble Admin token header is typically "Authorization: Bearer <token>"
-    # If your Bubble workspace requires a different header, change here.
+
+def bubble_headers():
     return {
-        "Authorization": f"Bearer {BUBBLE_API_TOKEN}",
-        "Content-Type": "application/json",
+        "Authorization": f"Bearer {BUBBLE_DATA_API_TOKEN}",
+        "Content-Type": "application/json"
     }
 
-def fetch_all_applications(limit: int = 100) -> List[Dict[str, Any]]:
-    """
-    Fetch ALL Application objects from Bubble Data API with pagination.
-    """
-    if not BUBBLE_BASE_URL or not BUBBLE_API_TOKEN:
-        raise RuntimeError("BUBBLE_BASE_URL / BUBBLE_API_TOKEN is not set in Render environment variables.")
 
-    results: List[Dict[str, Any]] = []
-    cursor = 0
+def get_all_applications():
+    url = f"{BUBBLE_DATA_API_BASE}/{BUBBLE_APP_TYPE}"
+    res = requests.get(url, headers=bubble_headers())
+    if res.status_code != 200:
+        raise Exception(f"Bubble fetch error: {res.text}")
+    return res.json().get("response", {}).get("results", [])
 
-    while True:
-        url = f"{BUBBLE_DATA_API_BASE}/Application"
-        params = {"cursor": cursor, "limit": limit}
-        r = requests.get(url, headers=_bubble_headers(), params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
 
-        chunk = data.get("response", {}).get("results", [])
-        results.extend(chunk)
+def create_daily_excel_record(file_url, label):
+    url = f"{BUBBLE_DATA_API_BASE}/DailyExcel"
+    payload = {
+        "file": file_url,
+        "label": label,
+        "status": "ready"
+    }
+    res = requests.post(url, headers=bubble_headers(), json=payload)
+    if res.status_code != 200:
+        raise Exception(f"Bubble create error: {res.text}")
+    return res.json()
 
-        remaining = data.get("response", {}).get("remaining", 0)
-        if remaining is None:
-            # Some Bubble setups may omit 'remaining'. If so, break when chunk smaller than limit.
-            if len(chunk) < limit:
-                break
-        else:
-            if remaining <= 0:
-                break
 
-        cursor += limit
+def get_latest_daily_excel():
+    url = f"{BUBBLE_DATA_API_BASE}/DailyExcel?sort_field=Created Date&descending=true&limit=1"
+    res = requests.get(url, headers=bubble_headers())
+    if res.status_code != 200:
+        raise Exception(f"Bubble latest error: {res.text}")
+    results = res.json().get("response", {}).get("results", [])
+    return results[0] if results else None
 
-    return results
 
 # =========================
-# Excel write logic
+# EXCEL GENERATION
 # =========================
-def write_excel_from_applications(
-    template_path: str,
-    out_path: str,
-    applications: List[Dict[str, Any]],
-    job_id: str,
-) -> Tuple[int, str]:
-    """
-    - Fill FIRST sheet only (per your last instruction)
-    - A9부터: A열=No(1..N)
-    - 나머지 컬럼은 예시로 B열에 Job No를 넣는 형태로 작성
-      (원하는 매핑이 있으면 컬럼별로 확장하면 됨)
-    """
-    wb = load_workbook(template_path)
-    ws = wb.worksheets[0]  # first sheet
 
-    start_row = 9  # A9
-    total = max(len(applications), 1)
-    done = 0
+def generate_excel_file():
+    applications = get_all_applications()
 
-    for idx, app_obj in enumerate(applications, start=1):
-        r = start_row + (idx - 1)
+    if not os.path.exists(TEMPLATE_PATH):
+        raise Exception("Template file not found")
 
-        # ---- A열: No 자동
-        ws.cell(row=r, column=1, value=idx)  # A
+    wb = load_workbook(TEMPLATE_PATH)
+    ws = wb.active
 
-        # ---- 예시: B열에 Job No
-        # Bubble field name이 뭔지에 따라 바꿔야 함.
-        # 보통은 app_obj["job_no"] 같은 형태일 수 있음.
-        # 안전하게 여러 후보를 시도:
-        job_no = (
-            app_obj.get("Job No")
-            or app_obj.get("job_no")
-            or app_obj.get("JobNo")
-            or app_obj.get("jobNo")
-            or ""
-        )
-        ws.cell(row=r, column=2, value=job_no)  # B
+    start_row = 9
+    row = start_row
 
-        done += 1
-        progress = int(done * 100 / total)
+    for idx, app_data in enumerate(applications, start=1):
+        ws[f"A{row}"] = idx  # No
+        ws[f"B{row}"] = app_data.get("company", "")
+        ws[f"C{row}"] = app_data.get("iso", "")
+        row += 1
 
-        with _jobs_lock:
-            if job_id in _jobs:
-                _jobs[job_id]["status"] = "processing"
-                _jobs[job_id]["progress_percent"] = progress
-                _jobs[job_id]["done_rows"] = done
-                _jobs[job_id]["total_rows"] = total
+    filename = today_label()
+    generated_dir = "generated"
+    os.makedirs(generated_dir, exist_ok=True)
 
-    wb.save(out_path)
-    return len(applications), out_path
+    file_path = os.path.join(generated_dir, filename)
+    wb.save(file_path)
+
+    public_url = f"{request.host_url.rstrip('/')}/download/{filename}"
+    return public_url, filename
+
 
 # =========================
-# Background worker
+# ROUTES
 # =========================
-def _run_refresh_all(job_id: str, filename_base: str):
-    try:
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "fetching"
-            _jobs[job_id]["progress_percent"] = 1
 
-        apps = fetch_all_applications(limit=100)
-
-        safe_base = "".join(c for c in filename_base if c.isalnum() or c in ("-", "_"))
-        if not safe_base:
-            safe_base = "IBGC_Application"
-
-        out_filename = f"{safe_base}.xlsx"
-        out_path = os.path.join(GENERATED_DIR, out_filename)
-
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "writing"
-            _jobs[job_id]["progress_percent"] = 5
-
-        row_count, _ = write_excel_from_applications(
-            template_path=TEMPLATE_PATH,
-            out_path=out_path,
-            applications=apps,
-            job_id=job_id,
-        )
-
-        file_url = f"{PUBLIC_BASE_URL}/generated/{out_filename}" if PUBLIC_BASE_URL else f"/generated/{out_filename}"
-
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "done"
-            _jobs[job_id]["progress_percent"] = 100
-            _jobs[job_id]["file_url"] = file_url
-            _jobs[job_id]["filename"] = out_filename
-            _jobs[job_id]["row_count"] = row_count
-            _jobs[job_id]["finished_at"] = _now_iso()
-
-            _latest.update({
-                "status": "done",
-                "file_url": file_url if file_url.startswith("http") else (f"{PUBLIC_BASE_URL}{file_url}" if PUBLIC_BASE_URL else file_url),
-                "filename": out_filename,
-                "created_at": _jobs[job_id]["finished_at"],
-                "row_count": row_count,
-            })
-
-    except Exception as e:
-        with _jobs_lock:
-            _jobs[job_id]["status"] = "failed"
-            _jobs[job_id]["progress_percent"] = 0
-            _jobs[job_id]["error"] = str(e)
-
-# =========================
-# Routes
-# =========================
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
 
-@app.post("/excel/refresh_all")
-def excel_refresh_all():
-    if not _auth_ok(request):
-        return jsonify({"error": "unauthorized"}), 401
 
-    body = request.get_json(silent=True) or {}
-    filename = body.get("filename") or f"IBGC_Application_{datetime.now().strftime('%y%m%d')}"
+@app.route("/excel/generate_daily", methods=["POST"])
+def excel_generate_daily():
+    if not require_api_key(request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    job_id = str(uuid.uuid4())
-    with _jobs_lock:
-        _jobs[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "progress_percent": 0,
-            "file_url": "",
-            "filename": "",
-            "row_count": 0,
-            "total_rows": 0,
-            "done_rows": 0,
-            "error": "",
-            "created_at": _now_iso(),
-            "finished_at": "",
-        }
+    try:
+        file_url, label = generate_excel_file()
+        create_daily_excel_record(file_url, label)
 
-    t = threading.Thread(target=_run_refresh_all, args=(job_id, filename), daemon=True)
-    t.start()
+        return jsonify({
+            "ok": True,
+            "file_url": file_url,
+            "label": label
+        })
 
-    return jsonify({"job_id": job_id, "status": "queued"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.get("/excel/status/<job_id>")
-def excel_status(job_id: str):
-    if not _auth_ok(request):
-        return jsonify({"error": "unauthorized"}), 401
 
-    with _jobs_lock:
-        job = _jobs.get(job_id)
+@app.route("/excel/refresh_now", methods=["POST"])
+def excel_refresh_now():
+    return excel_generate_daily()
 
-    if not job:
-        return jsonify({"error": "job not found", "status": "failed", "progress_percent": 0}), 404
 
-    # Ensure absolute file_url
-    file_url = job.get("file_url", "")
-    if file_url and not file_url.startswith("http"):
-        if PUBLIC_BASE_URL:
-            file_url = f"{PUBLIC_BASE_URL}{file_url}"
-        else:
-            file_url = _public_file_url(job.get("filename", ""))
-
-    return jsonify({
-        "job_id": job_id,
-        "status": job.get("status", ""),
-        "progress_percent": job.get("progress_percent", 0),
-        "file_url": file_url,
-        "filename": job.get("filename", ""),
-        "row_count": job.get("row_count", 0),
-        "total_rows": job.get("total_rows", 0),
-        "done_rows": job.get("done_rows", 0),
-        "error": job.get("error", ""),
-    })
-
-@app.get("/excel/latest")
+@app.route("/excel/latest", methods=["GET"])
 def excel_latest():
-    if not _auth_ok(request):
-        return jsonify({"error": "unauthorized"}), 401
+    if not require_api_key(request):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
-    # If still empty (server restarted), try to find newest file from directory
-    if not _latest.get("file_url"):
-        try:
-            files = [f for f in os.listdir(GENERATED_DIR) if f.lower().endswith(".xlsx")]
-            if files:
-                files.sort(key=lambda f: os.path.getmtime(os.path.join(GENERATED_DIR, f)), reverse=True)
-                f0 = files[0]
-                url = f"{PUBLIC_BASE_URL}/generated/{f0}" if PUBLIC_BASE_URL else _public_file_url(f0)
-                _latest.update({
-                    "status": "done",
-                    "file_url": url,
-                    "filename": f0,
-                    "created_at": _now_iso(),
-                    "row_count": 0,
-                })
-        except Exception:
-            pass
+    try:
+        latest = get_latest_daily_excel()
+        if not latest:
+            return jsonify({"ok": False, "error": "No file found"}), 404
 
-    return jsonify(_latest)
+        return jsonify({
+            "ok": True,
+            "file_url": latest.get("file"),
+            "label": latest.get("label"),
+            "created_at": latest.get("Created Date")
+        })
 
-@app.get("/generated/<path:filename>")
-def download_generated(filename: str):
-    # Serve with correct headers
-    file_path = os.path.join(GENERATED_DIR, filename)
-    if not os.path.isfile(file_path):
-        abort(404)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    # as_attachment=True forces download
-    return send_from_directory(GENERATED_DIR, filename, as_attachment=True, download_name=filename)
+
+@app.route("/download/<filename>", methods=["GET"])
+def download_file(filename):
+    return app.send_static_file(f"generated/{filename}")
+
+
+# =========================
+# MAIN
+# =========================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
