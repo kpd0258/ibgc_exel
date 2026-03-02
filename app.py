@@ -161,7 +161,7 @@ def generate_excel_file():
     row = start_row
 
     for idx, app_data in enumerate(applications, start=1):
-        in_charge = app_data.get("In_charge_of", "") or ""
+        in_charge = app_data.get("in_charge_of", "") or ""
         recommend = app_data.get("recommend", "") or "IBGC"
         job_no = app_data.get("JOB_NO", "") or ""
 
