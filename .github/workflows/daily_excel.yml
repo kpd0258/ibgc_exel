@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Call Render generate_daily endpoint
         run: |
-          curl -X POST "https://ibgc-excel-dev.onrender.com/excel/generate_daily" \
+          curl -X POST "https://ibgc-exel.onrender.com/excel/generate_daily" \
           -H "X-API-Key: ${{ secrets.EXCEL_API_KEY }}" \
           -H "Content-Type: application/json" \
           -d "{}"
