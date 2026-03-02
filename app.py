@@ -1,7 +1,7 @@
 import os
 import requests
 from datetime import datetime, timezone, timedelta
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from openpyxl import load_workbook
 
@@ -21,6 +21,7 @@ TEMPLATE_PATH = os.environ.get("TEMPLATE_PATH", "IBGC_Application_Template.xlsx"
 BUBBLE_DATA_API_BASE = f"{BUBBLE_BASE_URL}/api/1.1/obj"
 
 KST = timezone(timedelta(hours=9))
+GENERATED_DIR = os.environ.get("GENERATED_DIR", "generated")
 
 
 # =========================
@@ -61,11 +62,14 @@ def get_all_applications():
 
 
 def create_daily_excel_record(file_url, label):
+    """
+    DailyExcel 타입에 file, label만 저장.
+    (status는 환경/필드명 이슈 분리를 위해 일단 제거)
+    """
     url = f"{BUBBLE_DATA_API_BASE}/DailyExcel"
     payload = {
         "file": file_url,
-        "label": label,
-        "status": "ready"
+        "label": label
     }
     res = requests.post(url, headers=bubble_headers(), json=payload)
     if res.status_code != 200:
@@ -105,12 +109,12 @@ def generate_excel_file():
         row += 1
 
     filename = today_label()
-    generated_dir = "generated"
-    os.makedirs(generated_dir, exist_ok=True)
+    os.makedirs(GENERATED_DIR, exist_ok=True)
 
-    file_path = os.path.join(generated_dir, filename)
+    file_path = os.path.join(GENERATED_DIR, filename)
     wb.save(file_path)
 
+    # Render에서 접근 가능한 다운로드 URL 생성
     public_url = f"{request.host_url.rstrip('/')}/download/{filename}"
     return public_url, filename
 
@@ -171,7 +175,8 @@ def excel_latest():
 
 @app.route("/download/<filename>", methods=["GET"])
 def download_file(filename):
-    return app.send_static_file(f"generated/{filename}")
+    # generated 폴더에서 직접 서빙
+    return send_from_directory(GENERATED_DIR, filename, as_attachment=True)
 
 
 # =========================
