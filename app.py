@@ -42,6 +42,7 @@ TYPE_AUDIT_PROGRAM = "06. Audit Program"
 TYPE_DECISION_STAGE1 = "08. Decision Report : Stage1"
 TYPE_DECISION_STAGE2 = "09. Decision Report : Stage2"
 TYPE_CERT_ISSUANCE = "11. Certificate issuance"
+TYPE_CHAPTER_VIEWER = "Chapter Viewer"  # ✅ 추가
 
 
 # =========================
@@ -173,10 +174,6 @@ def normalize_standards(value):
         if it:
             out.add(it.upper())
     return out
-
-
-def has_iso(standards_set, iso_text):
-    return iso_text.upper() in standards_set
 
 
 def iso_combo_label(standards_set):
@@ -342,6 +339,9 @@ def fill_sheet_1(ws, applications):
         dr_stage2 = resolve_related(app_data, "09. Decision Report : Stage2", TYPE_DECISION_STAGE2) or {}
         cert_issuance = resolve_related(app_data, "11. Certificate issuance", TYPE_CERT_ISSUANCE) or {}
 
+        # ✅ NEW: Chapter Viewer
+        chapter_viewer = resolve_related(app_data, "Chapter Viewer", TYPE_CHAPTER_VIEWER) or {}
+
         # standards flags
         standards_set = normalize_standards(app_data.get("cert_standards"))
         has_9001 = "ISO 9001" in standards_set
@@ -354,8 +354,8 @@ def fill_sheet_1(ws, applications):
         # 1 index
         c[1] = idx
 
-        # 2 In_charge_of
-        c[2] = safe_str(app_data.get("In_charge_of"), "")
+        # 2 in_charge_of
+        c[2] = safe_str(app_data.get("in_charge_of"), "")
 
         # 3 recommend (default IBGC)
         c[3] = safe_str(app_data.get("recommend"), "IBGC")
@@ -518,14 +518,14 @@ def fill_sheet_1(ws, applications):
         except Exception:
             c[47] = ""
 
-        # 48 observer
-        c[48] = safe_str(app_form.get("observer"), "")
+        # ✅ 48: '김정석' (고정)
+        c[48] = "김정석"
 
-        # 49 technical expert
-        c[49] = safe_str(app_form.get("technical expert"), "")
+        # ✅ 49: Chapter Viewer - Technical reviewer
+        c[49] = safe_str(chapter_viewer.get("Technical reviewer"), "")
 
-        # 50 stage2 audit date yyyy-mm-dd (again)
-        c[50] = fmt_yyyy_mm_dd(app_form.get("stage2 audit date"), fallback="")
+        # ✅ 50: Chapter Viewer - Date of Receipt (yyyy-mm-dd)
+        c[50] = fmt_yyyy_mm_dd(chapter_viewer.get("Date of Receipt"), fallback="")
 
         # 51 Lead auditor
         c[51] = safe_str(app_form.get("Lead auditor"), "")
@@ -542,8 +542,8 @@ def fill_sheet_1(ws, applications):
         # 55 observer
         c[55] = safe_str(app_form.get("observer"), "")
 
-        # 56 approved
-        c[56] = safe_str(app_form.get("approved"), "")
+        # ✅ 56: '김정석' (고정)
+        c[56] = "김정석"
 
         # 57 Date of Audit_transfer yyyy-mm-dd
         c[57] = fmt_yyyy_mm_dd(audit_program.get("Date of Audit_transfer"), fallback="")
@@ -575,16 +575,16 @@ def fill_sheet_1(ws, applications):
         # 66 Audit_md_05
         c[66] = safe_str(audit_program.get("Audit_md_05"), "")
 
-        # 67 Stage1 audit type(5) else '-'
-        c[67] = safe_str(dr_stage1.get("audit type(5)"), "-")
+        # ✅ 67: Stage1 audit type(5) "있으면" Stage 1 Certification audit, 없으면 '-'
+        c[67] = "Stage 1 Certification audit" if safe_str(dr_stage1.get("audit type(5)"), "") != "" else "-"
 
-        # 68 Stage1 Approval of Evaluation_Date yyyy-mm-dd else '-'
+        # ✅ 68: Stage1 Approval of Evaluation_Date yyyy-mm-dd else '-'
         c[68] = fmt_yyyy_mm_dd(dr_stage1.get("Approval of Evaluation_Date"), fallback="-")
 
-        # 69 Stage2 audit type(5) else '-'
-        c[69] = safe_str(dr_stage2.get("audit type(5)"), "-")
+        # ✅ 69: Stage2 audit type(5) "있으면" Stage 2 Certification audit, 없으면 '-'
+        c[69] = "Stage 2 Certification audit" if safe_str(dr_stage2.get("audit type(5)"), "") != "" else "-"
 
-        # 70 Stage2 Verification Date yyyy-mm-dd else '-'
+        # ✅ 70: Stage2 Verification Date yyyy-mm-dd else '-'
         c[70] = fmt_yyyy_mm_dd(dr_stage2.get("Verification Date"), fallback="-")
 
         # 71 Reviewer of Certification Records else '-'
