@@ -325,7 +325,7 @@ def upload_file_to_bubble_storage(local_path: str, upload_filename: str) -> str:
 
 def fill_sheet_1(ws, applications):
     """
-    Sheet 1: "인증신청서 관리"
+    Sheet 1: "1. 인증신청서 관리"
     start row: 9
     Col mapping: 1..78
     """
