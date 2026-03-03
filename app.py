@@ -30,10 +30,10 @@ KST = timezone(timedelta(hours=9))
 # =========================
 # SHEET NAMES (4 sheets)
 # =========================
-SHEET_1 = "인증신청서 관리"
-SHEET_2 = "인결위 일정 관리"
-SHEET_3 = "UAF_IAF"
-SHEET_4 = "인증서 발행 관리대장=홈페이지 db+우편"
+SHEET_1 = "1. 인증신청서 관리"
+SHEET_2 = "2. 인결위 일정 관리"
+SHEET_3 = "3. UAF_IAF"
+SHEET_4 = "4. 인증서 발행 관리대장=홈페이지 db+우편"
 
 # Related data type names in Bubble (for reference fields)
 TYPE_APP_FORM = "01. Application Form"
